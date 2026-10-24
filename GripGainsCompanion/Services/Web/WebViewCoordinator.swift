@@ -141,13 +141,13 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         finishedPageLoads += 1
         Task { @MainActor in
-            try? await webView.evaluateJavaScript(JavaScriptBridge.observerScript)
+            _ = try? await webView.evaluateJavaScript(JavaScriptBridge.observerScript)
 
             // Reapply web-audio mute only when muted, so the default (sounds on) state
             // leaves the freshly loaded page completely untouched.
             if websiteAudioMuted {
-                try? await webView.evaluateJavaScript(JavaScriptBridge.websiteAudioMuteScript)
-                try? await webView.evaluateJavaScript(JavaScriptBridge.setWebsiteAudioMuted(true))
+                _ = try? await webView.evaluateJavaScript(JavaScriptBridge.websiteAudioMuteScript)
+                _ = try? await webView.evaluateJavaScript(JavaScriptBridge.setWebsiteAudioMuted(true))
             }
         }
     }
@@ -390,9 +390,9 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
         websiteAudioMuted = muted
         Task { @MainActor in
             if muted {
-                try? await webView?.evaluateJavaScript(JavaScriptBridge.websiteAudioMuteScript)
+                _ = try? await webView?.evaluateJavaScript(JavaScriptBridge.websiteAudioMuteScript)
             }
-            try? await webView?.evaluateJavaScript(JavaScriptBridge.setWebsiteAudioMuted(muted))
+            _ = try? await webView?.evaluateJavaScript(JavaScriptBridge.setWebsiteAudioMuted(muted))
         }
     }
 
