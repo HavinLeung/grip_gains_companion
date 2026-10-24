@@ -58,9 +58,9 @@ final class WebPageLoadingTests: XCTestCase {
         defer { server.stop() }
         server.failWorkoutResponses(1)
         let recorder = PageLoadRecorder()
-        // The fallback timeout is far beyond the test: the chunk failure itself triggers recovery.
-        let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 60)
-        let failedAt = ContinuousClock.now
+        let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 1)
+        try await waitForModuleState("failed", on: page)
+        XCTAssertEqual(recorder.navigationCount, 1, "A chunk error must not be an independent reload trigger")
 
         // The page reports the missing workout view and the app reloads once, without user action.
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
@@ -68,7 +68,6 @@ final class WebPageLoadingTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTAssertEqual(recorder.navigationCount, 2)
-        XCTAssertLessThan(ContinuousClock.now - failedAt, .seconds(2), "Recovery should not wait for the timeout")
         try await waitForModuleState("ready", on: page)
         try await assertTitle("Workout v1", on: page)
     }
@@ -102,7 +101,7 @@ final class WebPageLoadingTests: XCTestCase {
         let recorder = PageLoadRecorder()
         let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 1)
         try await waitForModuleState("ready", on: page)
-        // Once mounted, losing the root must not rearm either startup trigger.
+        // Once mounted, losing the root must not rearm the startup check.
         _ = try await page.evaluateJavaScript("document.querySelector('.timer-view').remove();")
         try await sendChunkError(to: page)
         try await Task.sleep(for: .seconds(1.2))
@@ -111,14 +110,15 @@ final class WebPageLoadingTests: XCTestCase {
         XCTAssertEqual(recorder.recoveryReports, 0)
     }
 
-    func testFallbackEndsWindowEvenWhenCurrentRouteNeedsNoWorkout() async throws {
+    func testLoginRouteAndReturnDoNotRearmStartup() async throws {
         let server = try await startServer(autoStart: false)
         defer { server.stop() }
         let recorder = PageLoadRecorder()
         let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.5)
-        _ = try await page.evaluateJavaScript("history.pushState({}, '', '/history');")
-        try await Task.sleep(for: .seconds(0.8))
+        _ = try await page.evaluateJavaScript("history.pushState({}, '', '/login');")
+        try await Task.sleep(for: .seconds(0.1))
         _ = try await page.evaluateJavaScript("history.pushState({}, '', '/timer');")
+        try await Task.sleep(for: .seconds(0.8))
         try await sendChunkError(to: page)
         XCTAssertEqual(recorder.navigationCount, 1)
         XCTAssertEqual(recorder.recoveryReports, 0)
@@ -176,8 +176,7 @@ final class WebPageLoadingTests: XCTestCase {
         defer { server.stop() }
         let recorder = PageLoadRecorder()
         recorder.holdRecoveryReports = true
-        let page = try await presentPage(server.url, recorder: recorder)
-        try await sendChunkError(to: page)
+        let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.3)
         try await waitForRecoveryReport(recorder)
         _ = try await page.evaluateJavaScript("void window.openWorkout();")
         try await waitForModuleState("ready", on: page)
@@ -192,8 +191,7 @@ final class WebPageLoadingTests: XCTestCase {
         defer { server.stop() }
         let recorder = PageLoadRecorder()
         recorder.holdRecoveryReports = true
-        let page = try await presentPage(server.url, recorder: recorder)
-        try await sendChunkError(to: page)
+        let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.3)
         try await waitForRecoveryReport(recorder)
         _ = try await page.evaluateJavaScript("history.pushState({}, '', '/history');")
         recorder.deliverRecoveryReports()
@@ -207,8 +205,7 @@ final class WebPageLoadingTests: XCTestCase {
         defer { server.stop() }
         let recorder = PageLoadRecorder()
         recorder.holdRecoveryReports = true
-        let page = try await presentPage(server.url, recorder: recorder)
-        try await sendChunkError(to: page)
+        let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.3)
         try await waitForRecoveryReport(recorder)
         let loaded = expectation(description: "Replacement document loaded")
         recorder.finished = { _ in loaded.fulfill() }
@@ -216,8 +213,9 @@ final class WebPageLoadingTests: XCTestCase {
         await fulfillment(of: [loaded], timeout: 5)
         recorder.finished = nil
         recorder.deliverRecoveryReports()
-        try await Task.sleep(for: .seconds(0.5))
+        try await Task.sleep(for: .seconds(1.5))
         XCTAssertEqual(recorder.navigationCount, 2, "Only the explicit replacement navigation should occur")
+        XCTAssertEqual(recorder.recoveryReports, 1, "The replacement document must not install another check")
     }
 
     func testQueuedRecoveryIsCancelledAcrossBackgroundAndReturn() async throws {
@@ -226,8 +224,7 @@ final class WebPageLoadingTests: XCTestCase {
         let recorder = PageLoadRecorder()
         recorder.holdRecoveryReports = true
         let state = PageHostState()
-        let page = try await presentPage(server.url, recorder: recorder, state: state)
-        try await sendChunkError(to: page)
+        _ = try await presentPage(server.url, recorder: recorder, state: state, missingWorkoutDelay: 0.3)
         try await waitForRecoveryReport(recorder)
         state.phase = .background
         try await Task.sleep(for: .seconds(0.2))
@@ -243,8 +240,7 @@ final class WebPageLoadingTests: XCTestCase {
         defer { server.stop() }
         let recorder = PageLoadRecorder()
         recorder.holdRecoveryReports = true
-        let page = try await presentPage(server.url, recorder: recorder)
-        try await sendChunkError(to: page)
+        let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.3)
         try await waitForRecoveryReport(recorder)
         // Deliver the old report while the new navigation is waiting for its HTML.
         server.delayNextDocumentResponse(0.5)
@@ -258,6 +254,77 @@ final class WebPageLoadingTests: XCTestCase {
         try await Task.sleep(for: .seconds(0.3))
         XCTAssertEqual(recorder.navigationCount, 2, "Recovery must not replace an in-flight navigation")
         XCTAssertEqual(server.documentRequests, 2)
+    }
+
+    func testInteractionAndPreparationCancelStartupRecovery() async throws {
+        let server = try await startServer(autoStart: false)
+        defer { server.stop() }
+        for trigger in ["pointer", "queuedPointer", "preparation"] {
+            let recorder = PageLoadRecorder()
+            recorder.holdRecoveryReports = true
+            let page = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.4)
+            if trigger == "queuedPointer" { try await waitForRecoveryReport(recorder) }
+            if trigger == "preparation" {
+                recorder.updatePreparationState(true)
+            } else {
+                _ = try await page.evaluateJavaScript("document.dispatchEvent(new Event('pointerdown'));")
+            }
+            recorder.deliverRecoveryReports()
+            try await Task.sleep(for: .seconds(0.7))
+            XCTAssertEqual(recorder.navigationCount, 1, trigger)
+        }
+    }
+
+    func testExpiredRecoveryReportDoesNotReload() async throws {
+        let server = try await startServer(autoStart: false)
+        defer { server.stop() }
+        let recorder = PageLoadRecorder()
+        recorder.holdRecoveryReports = true
+        _ = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.3)
+        try await waitForRecoveryReport(recorder)
+        try await Task.sleep(for: .seconds(1.2))
+        recorder.deliverRecoveryReports()
+        try await Task.sleep(for: .seconds(0.3))
+        XCTAssertEqual(recorder.navigationCount, 1)
+    }
+
+    func testOnlyNewProcessCanRearmAfterLoginAndWebViewReplacement() async throws {
+        let server = try await startServer(autoStart: false)
+        defer { server.stop() }
+        let lifetime = StartupRecoveryLifetime()
+        let initial = PageLoadRecorder(lifetime: lifetime)
+        let loginURL = server.url.deletingLastPathComponent().appendingPathComponent("login")
+        let page = try await presentPage(loginURL, recorder: initial, missingWorkoutDelay: 0.3)
+        let navigated = expectation(description: "Navigate from login to timer")
+        initial.finished = { _ in navigated.fulfill() }
+        page.load(URLRequest(url: server.url))
+        await fulfillment(of: [navigated], timeout: 5)
+        initial.finished = nil
+        try await Task.sleep(for: .seconds(0.6))
+        XCTAssertEqual(initial.navigationCount, 2)
+        XCTAssertEqual(initial.recoveryReports, 0)
+
+        let replacement = PageLoadRecorder(lifetime: lifetime)
+        _ = try await presentPage(server.url, recorder: replacement, missingWorkoutDelay: 0.3)
+        try await Task.sleep(for: .seconds(0.6))
+        XCTAssertEqual(replacement.navigationCount, 1)
+        XCTAssertEqual(replacement.recoveryReports, 0)
+
+        let newProcess = PageLoadRecorder(lifetime: StartupRecoveryLifetime())
+        _ = try await presentPage(server.url, recorder: newProcess, missingWorkoutDelay: 0.3)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(newProcess.navigationCount, 2)
+        XCTAssertEqual(newProcess.recoveryReports, 1)
+    }
+
+    func testStartupCheckDoesNotWaitForLoadEvent() async throws {
+        let server = try await startServer(autoStart: false, loadDelay: 2)
+        defer { server.stop() }
+        let recorder = PageLoadRecorder()
+        recorder.holdRecoveryReports = true
+        _ = try await presentPage(server.url, recorder: recorder, missingWorkoutDelay: 0.3)
+        XCTAssertEqual(recorder.recoveryReports, 1)
+        XCTAssertTrue(recorder.reportedBeforeFinish, "The startup check must run even while a subresource holds up load")
     }
 
     private func sendChunkError(to page: WKWebView) async throws {
@@ -323,9 +390,9 @@ final class WebPageLoadingTests: XCTestCase {
     }
 
     private func startServer(maxAge: Int = 0, cacheWorkout: Bool = false, autoStart: Bool = true,
-                             renderDelay: TimeInterval = 0) async throws -> WorkoutPageServer {
+                             renderDelay: TimeInterval = 0, loadDelay: TimeInterval = 0) async throws -> WorkoutPageServer {
         let server = try WorkoutPageServer(maxAge: maxAge, cacheWorkout: cacheWorkout,
-                                           autoStart: autoStart, renderDelay: renderDelay)
+                                           autoStart: autoStart, renderDelay: renderDelay, loadDelay: loadDelay)
         let ready = expectation(description: "HTTP fixture ready")
         server.start { ready.fulfill() }
         await fulfillment(of: [ready], timeout: 5)
@@ -391,9 +458,14 @@ private final class PageLoadRecorder: WebViewCoordinator {
     var started: ((WKWebView) -> Void)?
     var finished: ((WKWebView) -> Void)?
     var recoveryReports = 0
+    var reportedBeforeFinish = false
     var holdRecoveryReports = false
     var beforePageScripts: String?
     private var queuedRecoveryReports: [WKScriptMessage] = []
+
+    init(lifetime: StartupRecoveryLifetime = StartupRecoveryLifetime()) {
+        super.init(startupRecoveryLifetime: lifetime)
+    }
 
     override func setWebView(_ webView: WKWebView) {
         super.setWebView(webView)
@@ -431,6 +503,7 @@ private final class PageLoadRecorder: WebViewCoordinator {
 
     override func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "workoutMissing" {
+            if page == nil { reportedBeforeFinish = true }
             recoveryReports += 1
             if holdRecoveryReports {
                 queuedRecoveryReports.append(message)
@@ -449,17 +522,19 @@ private final class WorkoutPageServer: @unchecked Sendable {
     private let cacheWorkout: Bool
     private let autoStart: Bool
     private let renderDelay: TimeInterval
+    private let loadDelay: TimeInterval
     private var version = 1
     private var requests = 0
     private var totalRequests = 0
     private var failingWorkoutResponses = 0
     private var nextDocumentDelay: TimeInterval = 0
 
-    init(maxAge: Int, cacheWorkout: Bool, autoStart: Bool, renderDelay: TimeInterval) throws {
+    init(maxAge: Int, cacheWorkout: Bool, autoStart: Bool, renderDelay: TimeInterval, loadDelay: TimeInterval) throws {
         self.maxAge = maxAge
         self.cacheWorkout = cacheWorkout
         self.autoStart = autoStart
         self.renderDelay = renderDelay
+        self.loadDelay = loadDelay
         listener = try NWListener(using: .tcp, on: .any)
     }
 
@@ -511,6 +586,11 @@ private final class WorkoutPageServer: @unchecked Sendable {
                 body = self.document
                 type = "text/html"
                 cache = "max-age=\(self.maxAge)"
+            } else if path == "/slow-resource" {
+                responseDelay = self.loadDelay
+                body = "<svg xmlns='http://www.w3.org/2000/svg'/>"
+                type = "image/svg+xml"
+                cache = "no-store"
             } else if path == "/js/index-build-\(self.version).js" {
                 body = self.entryModule
                 type = "application/javascript"
@@ -544,7 +624,8 @@ private final class WorkoutPageServer: @unchecked Sendable {
         """
         <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Menu only</title><script type="module" src="/js/index-build-\(version).js"></script></head>
-        <body><nav>Menu</nav><main id="workout"></main></body></html>
+        <body><nav>Menu</nav><main id="workout"></main>
+        \(loadDelay > 0 ? "<img src='/slow-resource'>" : "")</body></html>
         """
     }
 

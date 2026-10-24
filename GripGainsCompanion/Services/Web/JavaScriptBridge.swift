@@ -2,13 +2,10 @@ import Foundation
 
 /// JavaScript code snippets for interacting with the gripgains.ca web UI
 enum JavaScriptBridge {
-    /// Report a timer page that finished loading without its workout view. After a deploy,
-    /// cached HTML can reference a removed workout chunk: the menu renders, the workout doesn't.
-    /// `.timer-view` is the TimerView root and stays mounted for the whole workout.
-    /// Recovery is armed only until the fallback check, the first workout render, or hiding
-    /// the page. The timeout is a slow-load heuristic, not proof that a chunk failed.
-    static func missingWorkoutCheckScript(delayMilliseconds: Int) -> String {
-        """
+    /// Installed only for the first startup document. Native code starts its bounded check
+    /// at commit; mounting, interaction, navigation, or backgrounding permanently cancels it.
+    /// A missing `.timer-view` is a slow-load heuristic, not proof that a chunk failed.
+    static let missingWorkoutCheckScript = """
         (function() {
             if (window.__ggWorkoutCheckInstalled) return;
             window.__ggWorkoutCheckInstalled = true;
@@ -17,14 +14,15 @@ enum JavaScriptBridge {
             let armed = true;
             let pending = false;
             let timer;
+            let started = false;
+            const interactions = ['pointerdown', 'touchstart', 'keydown', 'click', 'input'];
             const observer = new MutationObserver(cancelIfReadyOrHidden);
             function stop() {
                 armed = false;
                 clearTimeout(timer);
-                window.removeEventListener('load', schedule);
-                window.removeEventListener('vite:preloadError', check);
                 window.removeEventListener('pagehide', cancel);
                 document.removeEventListener('visibilitychange', cancelIfReadyOrHidden);
+                interactions.forEach(event => document.removeEventListener(event, cancel, true));
                 observer.disconnect();
             }
             function cancel() {
@@ -41,31 +39,32 @@ enum JavaScriptBridge {
             function check() {
                 if (!armed) return;
                 pending = canRecover();
-                stop();
+                armed = false;
+                // Keep cancellation listeners alive while Swift confirms the queued report.
                 if (pending) window.webkit.messageHandlers.workoutMissing.postMessage(token);
+                else cancel();
             }
             // Swift confirms against this exact document after receiving the asynchronous report.
             window.__ggConfirmWorkoutRecovery = function(expectedToken) {
                 if (expectedToken !== token) return false;
                 const allowed = pending && canRecover();
-                pending = false;
+                cancel();
                 return allowed;
             };
             window.__ggCancelWorkoutRecovery = cancel;
-            function schedule() {
-                if (armed) timer = setTimeout(check, \(delayMilliseconds));
-            }
+            window.__ggStartWorkoutRecovery = function(delayMilliseconds) {
+                if (!armed || started) return;
+                started = true;
+                // setTimeout, not setInterval: the background time script replays intervals.
+                timer = setTimeout(check, delayMilliseconds);
+            };
             if (!canRecover()) { cancel(); return; }
             observer.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
-            window.addEventListener('vite:preloadError', check);
             window.addEventListener('pagehide', cancel);
             document.addEventListener('visibilitychange', cancelIfReadyOrHidden);
-            // setTimeout, not setInterval: the background time script replays intervals.
-            if (document.readyState === 'complete') schedule();
-            else window.addEventListener('load', schedule);
+            interactions.forEach(event => document.addEventListener(event, cancel, true));
         })();
         """
-    }
 
     /// Close the weight picker if it's open on page load
     /// This handles the case where Vue restores the picker state after a page refresh
