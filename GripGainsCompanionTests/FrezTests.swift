@@ -110,14 +110,31 @@ final class FrezTests: XCTestCase {
     }
 
     func testRequestHasOnlySerialAndKeyIsInHeader() throws {
-        let request = try FrezCoefficientClient.request(serial: "FrezDyno-000123", accessKey: "  test-key\n")
+        let request = try FrezCoefficientClient.request(for: .serial("FrezDyno-000123"), accessKey: "  test-key\n")
         XCTAssertEqual(request.url?.absoluteString, "https://api.frez.app/functions/v1/dyno-coefficient?serial=FrezDyno-000123")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Frez-Access-Key"), "test-key")
         XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
-        XCTAssertThrowsError(try FrezCoefficientClient.request(serial: "FrezDyno-000123&name=other", accessKey: "key"))
-        XCTAssertThrowsError(try FrezCoefficientClient.request(serial: "FrezDyno-000123", accessKey: ""))
-        XCTAssertThrowsError(try FrezCoefficientClient.request(serial: "FrezDyno-000123", accessKey: "key\r\nInjected: value"))
+        XCTAssertThrowsError(try FrezCoefficientClient.request(for: .serial("FrezDyno-000123"), accessKey: ""))
+        XCTAssertThrowsError(try FrezCoefficientClient.request(for: .serial("FrezDyno-000123"), accessKey: "key\r\nInjected: value"))
+    }
+
+    func testRequestNormalizesIdentifiersWithoutRestrictingSerialFormat() throws {
+        for (identifier, queryName, value) in [
+            (FrezDeviceIdentifier.serial(" \0ABC-12\0345678\0\r\n"), "serial", "ABC-12345678"),
+            (.serial("FrezDyno-000123&name=other"), "serial", "FrezDyno-000123&name=other"),
+            (.name(" \0FrezDyno-000123\n"), "name", "FrezDyno-000123")
+        ] {
+            let request = try FrezCoefficientClient.request(for: identifier, accessKey: "test-key")
+            let query = try XCTUnwrap(URLComponents(url: XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems)
+            XCTAssertEqual(query, [URLQueryItem(name: queryName, value: value)])
+            XCTAssertFalse(request.url!.absoluteString.contains("test-key"))
+        }
+        for identifier in [FrezDeviceIdentifier.serial(" \0\n"), .name("")] {
+            XCTAssertThrowsError(try FrezCoefficientClient.request(for: identifier, accessKey: "test-key")) {
+                XCTAssertEqual($0 as? FrezError, .missingIdentifier)
+            }
+        }
     }
 
     func testAllDocumentedAPIFailuresHaveActionableErrors() {
@@ -144,8 +161,10 @@ final class FrezTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [FrezURLProtocol.self]
         let client = FrezCoefficientClient(configuration: config)
-        let coefficient = try await client.coefficient(serial: "FrezDyno-000123", accessKey: "test-key")
-        XCTAssertEqual(coefficient, 0.000012345678)
+        for identifier in [FrezDeviceIdentifier.serial("ABC-12345678"), .name("FrezDyno-000123")] {
+            let coefficient = try await client.coefficient(for: identifier, accessKey: "test-key")
+            XCTAssertEqual(coefficient, 0.000012345678)
+        }
     }
 
     func testRedirectsAreRejected() {
@@ -190,9 +209,12 @@ final class FrezTests: XCTestCase {
     }
 
     @MainActor
-    private func configuredService(provider: FrezCoefficientProviding) -> (FrezDynoService, FrezMockPeripheral) {
+    private func configuredService(provider: FrezCoefficientProviding,
+                                   serialData: Data? = Data("FrezDyno-000123\0".utf8),
+                                   bluetoothName: String? = "FrezDyno-000123",
+                                   serialError: Error? = nil) -> (FrezDynoService, FrezMockPeripheral) {
         let peripheral = FrezMockPeripheral()
-        let service = FrezDynoService(peripheral: peripheral, accessKey: "test-key", coefficients: provider)
+        let service = FrezDynoService(peripheral: peripheral, accessKey: "test-key", bluetoothName: bluetoothName, coefficients: provider)
         service.discoverServices()
         service.servicesDiscovered([CBMutableService(type: FrezGATT.service, primary: true),
                                     CBMutableService(type: FrezGATT.information, primary: false)])
@@ -201,13 +223,148 @@ final class FrezTests: XCTestCase {
             CBMutableCharacteristic(type: FrezGATT.serial, properties: [.read], value: nil, permissions: [.readable]),
             CBMutableCharacteristic(type: FrezGATT.firmware, properties: [.read], value: nil, permissions: [.readable])
         ], for: FrezGATT.information)
-        service.receivedValue(Data("FrezDyno-000123\0".utf8), for: FrezGATT.serial)
+        service.receivedValue(serialData, for: FrezGATT.serial, error: serialError)
         service.receivedValue(Data("1.0".utf8), for: FrezGATT.firmware)
+        discoverMeasurementCharacteristics(service)
+        return (service, peripheral)
+    }
+
+    private func discoverMeasurementCharacteristics(_ service: FrezDynoService) {
         service.characteristicsDiscovered([
             CBMutableCharacteristic(type: FrezGATT.write, properties: [.write], value: nil, permissions: [.writeable]),
             CBMutableCharacteristic(type: FrezGATT.notify, properties: [.notify], value: nil, permissions: [])
         ], for: FrezGATT.service)
-        return (service, peripheral)
+    }
+
+    @MainActor
+    func testServiceUsesNormalizedSerialBeforeBluetoothName() async {
+        let provider = FrezStubCoefficients()
+        let (service, peripheral) = configuredService(provider: provider, serialData: Data(" \0ABC-12\0345678\0\n".utf8))
+        defer { service.invalidate() }
+        let subscribed = expectation(description: "Serial authorized")
+        peripheral.onNotify = { if $0 { subscribed.fulfill() } }
+        await fulfillment(of: [subscribed], timeout: 2)
+        XCTAssertEqual(provider.identifiers, [.serial("ABC-12345678")])
+    }
+
+    @MainActor
+    func testServiceFallsBackToNameForEmptyMissingMalformedOrFailedSerialRead() async {
+        let cases: [(Data?, Error?)] = [
+            (nil, nil), (Data(), nil), (Data(" \0\r\n".utf8), nil), (Data([0xFF]), nil),
+            (Data("ignored-on-error".utf8), NSError(domain: CBErrorDomain, code: 0))
+        ]
+        for (data, error) in cases {
+            let provider = FrezStubCoefficients()
+            let (service, peripheral) = configuredService(provider: provider, serialData: data,
+                                                          bluetoothName: " \0FrezDyno-000456\n", serialError: error)
+            defer { service.invalidate() }
+            service.onError = { XCTFail("Unexpected setup error: \($0)") }
+            let subscribed = expectation(description: "Name authorized")
+            peripheral.onNotify = { if $0 { subscribed.fulfill() } }
+            await fulfillment(of: [subscribed], timeout: 2)
+            XCTAssertEqual(provider.identifiers, [.name("FrezDyno-000456")])
+            XCTAssertTrue(peripheral.writes.isEmpty)
+            service.notificationStateChanged(true)
+            var samples: [Double] = []
+            service.onForceSample = { weight, _ in samples.append(weight) }
+            for i in 0..<11 { service.receivedValue(packet(start: UInt32(i * 36)), for: FrezGATT.notify) }
+            XCTAssertTrue(samples.isEmpty)
+            service.receivedValue(packet(start: 396), for: FrezGATT.notify)
+            XCTAssertEqual(samples.count, 8)
+        }
+    }
+
+    @MainActor
+    func testServiceFallsBackWhenSerialServiceOrCharacteristicIsUnavailable() async {
+        for scenario in ["missing service", "missing characteristic", "unreadable characteristic", "discovery error"] {
+            let provider = FrezStubCoefficients()
+            let peripheral = FrezMockPeripheral()
+            let service = FrezDynoService(peripheral: peripheral, accessKey: "test-key", bluetoothName: "FrezDyno-000456", coefficients: provider)
+            defer { service.invalidate() }
+            service.onError = { XCTFail("Unexpected error for \(scenario): \($0)") }
+            let subscribed = expectation(description: scenario)
+            peripheral.onNotify = { if $0 { subscribed.fulfill() } }
+            service.discoverServices()
+            var services = [CBMutableService(type: FrezGATT.service, primary: true)]
+            if scenario != "missing service" { services.append(CBMutableService(type: FrezGATT.information, primary: false)) }
+            service.servicesDiscovered(services)
+            discoverMeasurementCharacteristics(service)
+            if scenario != "missing service" {
+                let characteristics: [CBCharacteristic] = scenario == "unreadable characteristic"
+                    ? [CBMutableCharacteristic(type: FrezGATT.serial, properties: [], value: nil, permissions: [])] : []
+                service.characteristicsDiscovered(characteristics, for: FrezGATT.information,
+                                                   error: scenario == "discovery error" ? NSError(domain: CBErrorDomain, code: 0) : nil)
+            }
+            await fulfillment(of: [subscribed], timeout: 2)
+            XCTAssertEqual(provider.identifiers, [.name("FrezDyno-000456")])
+        }
+    }
+
+    @MainActor
+    func testServiceWaitsForOutstandingSerialBeforeChoosingIdentifier() async {
+        let provider = FrezStubCoefficients()
+        let peripheral = FrezMockPeripheral()
+        let service = FrezDynoService(peripheral: peripheral, accessKey: "test-key", bluetoothName: "FrezDyno-000456", coefficients: provider)
+        defer { service.invalidate() }
+        service.discoverServices()
+        service.servicesDiscovered([CBMutableService(type: FrezGATT.service, primary: true),
+                                    CBMutableService(type: FrezGATT.information, primary: false)])
+        discoverMeasurementCharacteristics(service)
+        service.characteristicsDiscovered([
+            CBMutableCharacteristic(type: FrezGATT.serial, properties: [.read], value: nil, permissions: [.readable]),
+            CBMutableCharacteristic(type: FrezGATT.firmware, properties: [.read], value: nil, permissions: [.readable])
+        ], for: FrezGATT.information)
+        service.receivedValue(nil, for: FrezGATT.firmware, error: NSError(domain: CBErrorDomain, code: 0))
+        // Yield to catch a premature name request while serial is still pending.
+        await Task.yield()
+        XCTAssertTrue(provider.identifiers.isEmpty)
+        let subscribed = expectation(description: "Late serial authorized")
+        peripheral.onNotify = { if $0 { subscribed.fulfill() } }
+        service.receivedValue(Data(" ABC-12345678\0\n".utf8), for: FrezGATT.serial)
+        await fulfillment(of: [subscribed], timeout: 2)
+        service.receivedValue(Data("ABC-12345678".utf8), for: FrezGATT.serial)
+        XCTAssertEqual(provider.identifiers, [.serial("ABC-12345678")])
+    }
+
+    @MainActor
+    func testServiceWithoutEitherIdentifierFailsBeforeRequestingCalibration() {
+        let provider = FrezStubCoefficients()
+        let peripheral = FrezMockPeripheral()
+        let service = FrezDynoService(peripheral: peripheral, accessKey: "test-key", bluetoothName: " \0\n", coefficients: provider)
+        defer { service.invalidate() }
+        var failure: FrezError?
+        service.onError = { failure = $0 }
+        service.discoverServices()
+        service.servicesDiscovered([CBMutableService(type: FrezGATT.service, primary: true)])
+        discoverMeasurementCharacteristics(service)
+        XCTAssertEqual(failure, .missingIdentifier)
+        XCTAssertFalse(failure!.localizedDescription.contains("firmware"))
+        XCTAssertTrue(provider.identifiers.isEmpty)
+        XCTAssertTrue(peripheral.notifications.isEmpty)
+        XCTAssertTrue(peripheral.writes.isEmpty)
+    }
+
+    @MainActor
+    func testNameFallbackStillRequiresMeasurementServiceAndCharacteristics() {
+        for scenario in ["missing service", "missing characteristics", "discovery error"] {
+            let provider = FrezStubCoefficients()
+            let peripheral = FrezMockPeripheral()
+            let service = FrezDynoService(peripheral: peripheral, accessKey: "test-key", bluetoothName: "FrezDyno-000456", coefficients: provider)
+            defer { service.invalidate() }
+            var failure: FrezError?
+            service.onError = { failure = $0 }
+            service.discoverServices()
+            if scenario == "missing service" {
+                service.servicesDiscovered([])
+            } else {
+                service.servicesDiscovered([CBMutableService(type: FrezGATT.service, primary: true)])
+                service.characteristicsDiscovered([], for: FrezGATT.service,
+                                                   error: scenario == "discovery error" ? NSError(domain: CBErrorDomain, code: 0) : nil)
+            }
+            XCTAssertNotNil(failure, scenario)
+            XCTAssertTrue(provider.identifiers.isEmpty)
+            XCTAssertTrue(peripheral.notifications.isEmpty)
+        }
     }
 
     @MainActor
@@ -220,6 +377,7 @@ final class FrezTests: XCTestCase {
         XCTAssertTrue(peripheral.writes.isEmpty)
         await fulfillment(of: [subscription], timeout: 2)
         XCTAssertEqual(provider.requests, 1)
+        XCTAssertEqual(provider.identifiers, [.serial("FrezDyno-000123")])
         XCTAssertTrue(peripheral.writes.isEmpty)
         service.notificationStateChanged(true)
         service.notificationStateChanged(true)
@@ -264,16 +422,23 @@ final class FrezTests: XCTestCase {
 
     @MainActor
     func testRejectedAccessDoesNotSubscribeStartOrRetry() async {
-        let provider = FrezStubCoefficients()
-        provider.failure = .invalidKey
-        let (service, peripheral) = configuredService(provider: provider)
-        defer { service.invalidate() }
-        let failed = expectation(description: "Access denied")
-        service.onError = { error in XCTAssertEqual(error, .invalidKey); failed.fulfill() }
-        await fulfillment(of: [failed], timeout: 2)
-        XCTAssertEqual(provider.requests, 1)
-        XCTAssertTrue(peripheral.notifications.isEmpty)
-        XCTAssertTrue(peripheral.writes.isEmpty)
+        for failure: FrezError in [.invalidKey, .deviceLimit, .notAllowlisted, .deviceNotFound, .ownershipReview, .rateLimited] {
+            for serialData: Data? in [Data("FrezDyno-000123".utf8), nil] {
+                let provider = FrezStubCoefficients()
+                provider.failure = failure
+                let (service, peripheral) = configuredService(provider: provider, serialData: serialData)
+                defer { service.invalidate() }
+                let failed = expectation(description: "Access denied")
+                service.onError = { error in XCTAssertEqual(error, failure); failed.fulfill() }
+                service.onForceSample = { _, _ in XCTFail("No readings without calibration") }
+                await fulfillment(of: [failed], timeout: 2)
+                service.notificationStateChanged(true)
+                service.receivedValue(packet(), for: FrezGATT.notify)
+                XCTAssertEqual(provider.identifiers, [serialData == nil ? .name("FrezDyno-000123") : .serial("FrezDyno-000123")])
+                XCTAssertTrue(peripheral.notifications.isEmpty)
+                XCTAssertTrue(peripheral.writes.isEmpty)
+            }
+        }
     }
 
     @MainActor
@@ -332,15 +497,15 @@ private final class FrezMemoryKeyStore: FrezAccessKeyStoring {
 }
 
 private final class FrezStubCoefficients: FrezCoefficientProviding {
-    var requests = 0
+    var identifiers: [FrezDeviceIdentifier] = []
+    var requests: Int { identifiers.count }
     var failure: FrezError?
     var pause = false
     var continuation: CheckedContinuation<Double, Never>?
     var onRequest: (() -> Void)?
     var onReturn: (() -> Void)?
-    func coefficient(serial: String, accessKey: String) async throws -> Double {
-        requests += 1
-        XCTAssertEqual(serial, "FrezDyno-000123")
+    func coefficient(for identifier: FrezDeviceIdentifier, accessKey: String) async throws -> Double {
+        identifiers.append(identifier)
         XCTAssertEqual(accessKey, "test-key")
         if let failure { throw failure }
         if pause {

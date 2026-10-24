@@ -28,6 +28,7 @@ extension CBPeripheral: FrezPeripheral {}
 final class FrezDynoService: NSObject, CBPeripheralDelegate {
     private let peripheral: FrezPeripheral
     private let coefficients: FrezCoefficientProviding
+    private let bluetoothName: String?
     private var accessKey: String?
     private var coefficientTask: Task<Void, Never>?
     private var timer: Timer?
@@ -55,11 +56,12 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
     var onBatteryLevel: ((Int) -> Void)?
     var onError: ((FrezError) -> Void)?
 
-    init(peripheral: FrezPeripheral, accessKey: String,
+    init(peripheral: FrezPeripheral, accessKey: String, bluetoothName: String? = nil,
          coefficients: FrezCoefficientProviding = FrezCoefficientClient()) {
         self.peripheral = peripheral
         self.accessKey = accessKey
         self.coefficients = coefficients
+        self.bluetoothName = bluetoothName
         super.init()
         peripheral.delegate = self
     }
@@ -82,7 +84,7 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
     func servicesDiscovered(_ services: [CBService]) {
         guard active else { return }
         let ids = Set(services.map(\.uuid))
-        guard ids.contains(FrezGATT.service), ids.contains(FrezGATT.information) else {
+        guard ids.contains(FrezGATT.service) else {
             failProtocol("Required Frez services are missing.")
             return
         }
@@ -99,8 +101,18 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
         }
     }
 
-    func characteristicsDiscovered(_ characteristics: [CBCharacteristic], for service: CBUUID) {
+    func characteristicsDiscovered(_ characteristics: [CBCharacteristic], for service: CBUUID, error: Error? = nil) {
         guard active else { return }
+        if error != nil {
+            if service == FrezGATT.service {
+                failProtocol("Frez characteristic discovery failed.")
+            } else {
+                // Device information and battery are optional; a name can identify the Dyno.
+                pendingServices.remove(service)
+                fetchCoefficientIfReady()
+            }
+            return
+        }
         if service == FrezGATT.service {
             notifyCharacteristic = characteristics.first { $0.uuid == FrezGATT.notify && $0.properties.contains(.notify) }
             writeCharacteristic = characteristics.first { $0.uuid == FrezGATT.write && $0.properties.contains(.write) }
@@ -109,11 +121,6 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
                 return
             }
         } else {
-            if service == FrezGATT.information,
-               !characteristics.contains(where: { $0.uuid == FrezGATT.serial && $0.properties.contains(.read) }) {
-                failProtocol("The Frez serial characteristic is missing.")
-                return
-            }
             for characteristic in characteristics where characteristic.properties.contains(.read) {
                 guard [FrezGATT.serial, FrezGATT.firmware, FrezGATT.battery].contains(characteristic.uuid) else { continue }
                 pendingReads.insert(characteristic.uuid)
@@ -124,17 +131,18 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
         fetchCoefficientIfReady()
     }
 
-    func receivedValue(_ data: Data, for uuid: CBUUID) {
+    func receivedValue(_ data: Data?, for uuid: CBUUID, error: Error? = nil) {
         guard active else { return }
         switch uuid {
         case FrezGATT.serial:
-            serial = String(data: data, encoding: .utf8)?.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+            serial = error == nil ? data.flatMap { String(data: $0, encoding: .utf8) } : nil
         case FrezGATT.firmware:
-            firmwareVersion = String(data: data, encoding: .utf8)?.trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+            firmwareVersion = error == nil ? FrezDeviceIdentifier.normalized(data.flatMap { String(data: $0, encoding: .utf8) }) : nil
         case FrezGATT.battery:
-            batteryLevel = data.first.flatMap { $0 <= 100 ? $0 : nil }
+            batteryLevel = error == nil ? data?.first.flatMap { $0 <= 100 ? $0 : nil } : nil
             if let batteryLevel { onBatteryLevel?(Int(batteryLevel)) }
         case FrezGATT.notify:
+            guard error == nil, let data else { failProtocol("Could not read Frez data."); return }
             guard sentStart, measurement != nil else { return }
             do {
                 // iOS negotiates MTU automatically. The parser requires all 74 bytes;
@@ -167,7 +175,10 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
     private func fetchCoefficientIfReady() {
         guard active, pendingServices.isEmpty, pendingReads.isEmpty,
               notifyCharacteristic != nil, writeCharacteristic != nil, !requestedCoefficient else { return }
-        guard let serial else { fail(.invalidSerial); return }
+        guard let identifier = FrezDeviceIdentifier.resolve(serial: serial, name: bluetoothName) else {
+            fail(.missingIdentifier)
+            return
+        }
         guard let accessKey else { fail(.missingKey); return }
         requestedCoefficient = true
         self.accessKey = nil
@@ -175,7 +186,7 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
         let provider = coefficients
         coefficientTask = Task { @MainActor [weak self] in
             do {
-                let coefficient = try await provider.coefficient(serial: serial, accessKey: accessKey)
+                let coefficient = try await provider.coefficient(for: identifier, accessKey: accessKey)
                 guard !Task.isCancelled, let self, self.active else { return }
                 self.measurement = try FrezMeasurement(coefficient: coefficient)
                 self.requestedNotifications = true
@@ -276,13 +287,11 @@ final class FrezDynoService: NSObject, CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard error == nil else { failProtocol("Frez characteristic discovery failed."); return }
-        characteristicsDiscovered(service.characteristics ?? [], for: service.uuid)
+        characteristicsDiscovered(service.characteristics ?? [], for: service.uuid, error: error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard error == nil, let data = characteristic.value else { failProtocol("Could not read Frez data."); return }
-        receivedValue(data, for: characteristic.uuid)
+        receivedValue(characteristic.value, for: characteristic.uuid, error: error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {

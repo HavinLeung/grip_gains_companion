@@ -88,13 +88,15 @@ struct ForceDevice: Identifiable, Equatable {
     let peripheralIdentifier: UUID
     let type: DeviceType
     var rssi: Int
+    var advertisedName: String?
 
-    init(peripheral: CBPeripheral, type: DeviceType, rssi: Int = 0) {
+    init(peripheral: CBPeripheral, type: DeviceType, rssi: Int = 0, advertisedName: String? = nil) {
         self.id = peripheral.identifier
-        self.name = peripheral.name ?? type.displayName
+        self.name = peripheral.name ?? advertisedName ?? type.displayName
         self.peripheralIdentifier = peripheral.identifier
         self.type = type
         self.rssi = rssi
+        self.advertisedName = advertisedName
     }
 
     /// Initialize from advertisement data (for WHC06 which doesn't connect)

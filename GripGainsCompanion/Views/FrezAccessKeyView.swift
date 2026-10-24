@@ -48,12 +48,13 @@ struct FrezAccessKeyView: View {
                     Text("Personal access key")
                 } footer: {
                     Text(bluetoothManager.canEditFrezAccessKey
-                         ? "Stored in iOS Keychain on this device. Your key and Dyno serial are sent only to Frez to retrieve calibration when connecting. The key is verified when you connect a Dyno."
+                         ? "Stored in iOS Keychain on this device. Your key and Dyno serial (or Bluetooth name if the serial is unavailable) are sent only to Frez to retrieve calibration when connecting. The key is verified when you connect a Dyno."
                          : "Disconnect your Frez Dyno before changing or removing its key.")
                 }
 
                 Section {
                     Text("Internet access is required each time you connect. Keep the Dyno unloaded until zeroing is complete.")
+                    Text("If the Dyno's serial is unavailable, add its Bluetooth name to Developer allowlist devices in your Frez dashboard.")
                     Text("Calibration is provided by Frez's official API. Readings may differ slightly from the Frez app.")
                 } footer: {
                     Text("Unofficial app — not affiliated with or endorsed by Frez.")

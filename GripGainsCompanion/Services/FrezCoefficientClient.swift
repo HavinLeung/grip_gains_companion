@@ -2,7 +2,7 @@ import Foundation
 
 enum FrezError: Error, LocalizedError, Equatable {
     case missingKey, invalidKey, keychain, disconnectBeforeEditing
-    case invalidSerial, invalidRequest, deviceLimit, notAllowlisted, deviceNotFound, ownershipReview
+    case missingIdentifier, invalidRequest, deviceLimit, notAllowlisted, deviceNotFound, ownershipReview
     case invalidCoefficient, rateLimited, unavailable, network
     case protocolFailure(String)
 
@@ -12,10 +12,10 @@ enum FrezError: Error, LocalizedError, Equatable {
         case .invalidKey: return "Frez rejected your access key. Check or replace it in Frez API Key settings."
         case .keychain: return "Could not access the saved Frez key. Unlock your phone and try again."
         case .disconnectBeforeEditing: return "Disconnect your Frez Dyno before changing its access key."
-        case .invalidSerial: return "The Dyno returned an invalid serial number. Check its firmware."
+        case .missingIdentifier: return "Could not read the Dyno's serial number or Bluetooth name. Scan for the Dyno again and reconnect."
         case .invalidRequest: return "Frez could not accept this calibration request. Check for an app update."
         case .deviceLimit: return "Your Frez account has reached its Personal API device limit. Check Usage in the Frez developer dashboard."
-        case .notAllowlisted: return "Frez denied access to this device. Check your developer dashboard or contact Frez support."
+        case .notAllowlisted: return "Frez denied access to this device. Add its Bluetooth name to Developer allowlist devices in your Frez dashboard, then reconnect."
         case .deviceNotFound: return "Frez has no calibration for this Dyno. Contact support@frez.app."
         case .ownershipReview: return "Frez requires an ownership review for this Dyno. Contact support@frez.app."
         case .invalidCoefficient: return "Frez returned unusable calibration. No force readings can be shown. Contact Frez support."
@@ -27,8 +27,33 @@ enum FrezError: Error, LocalizedError, Equatable {
     }
 }
 
+/// The API accepts exactly one identifier. Native clients prefer the serial when readable.
+enum FrezDeviceIdentifier: Equatable {
+    case serial(String)
+    case name(String)
+
+    static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let cleaned = value.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    static func resolve(serial: String?, name: String?) -> Self? {
+        if let serial = normalized(serial) { return .serial(serial) }
+        if let name = normalized(name) { return .name(name) }
+        return nil
+    }
+
+    var queryItem: URLQueryItem {
+        switch self {
+        case .serial(let value): return URLQueryItem(name: "serial", value: Self.normalized(value))
+        case .name(let value): return URLQueryItem(name: "name", value: Self.normalized(value))
+        }
+    }
+}
+
 protocol FrezCoefficientProviding {
-    func coefficient(serial: String, accessKey: String) async throws -> Double
+    func coefficient(for identifier: FrezDeviceIdentifier, accessKey: String) async throws -> Double
 }
 
 /// No disk cache, cookies, credential storage, or redirects carrying the personal key.
@@ -47,22 +72,20 @@ final class FrezCoefficientClient: NSObject, FrezCoefficientProviding, URLSessio
         return key
     }
 
-    static func request(serial: String, accessKey: String) throws -> URLRequest {
-        guard serial.utf8.count == 15,
-              serial.range(of: "^FrezDyno-[0-9]{6}$", options: .regularExpression) != nil else {
-            throw FrezError.invalidSerial
-        }
+    static func request(for identifier: FrezDeviceIdentifier, accessKey: String) throws -> URLRequest {
+        let queryItem = identifier.queryItem
+        guard queryItem.value != nil else { throw FrezError.missingIdentifier }
         let key = try validatedKey(accessKey)
         var url = URLComponents(string: "https://api.frez.app/functions/v1/dyno-coefficient")!
-        url.queryItems = [URLQueryItem(name: "serial", value: serial)]
+        url.queryItems = [queryItem]
         var request = URLRequest(url: url.url!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
         request.setValue(key, forHTTPHeaderField: "X-Frez-Access-Key")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
     }
 
-    func coefficient(serial: String, accessKey: String) async throws -> Double {
-        let request = try Self.request(serial: serial, accessKey: accessKey)
+    func coefficient(for identifier: FrezDeviceIdentifier, accessKey: String) async throws -> Double {
+        let request = try Self.request(for: identifier, accessKey: accessKey)
         let config = configuration.copy() as! URLSessionConfiguration
         config.urlCache = nil
         config.httpCookieStorage = nil
@@ -80,7 +103,7 @@ final class FrezCoefficientClient: NSObject, FrezCoefficientProviding, URLSessio
         } catch let error as FrezError {
             throw error
         } catch {
-            // Never surface URLSession's request details (serial or key) in UI/logs.
+            // Never surface URLSession's request details (device identifier or key) in UI/logs.
             throw FrezError.network
         }
     }

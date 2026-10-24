@@ -637,11 +637,15 @@ extension BluetoothManager: CBCentralManagerDelegate {
         }
 
         // Create device
-        let device = ForceDevice(peripheral: peripheral, type: deviceType, rssi: RSSI.intValue)
+        let device = ForceDevice(peripheral: peripheral, type: deviceType, rssi: RSSI.intValue,
+                                 advertisedName: advertisementData[CBAdvertisementDataLocalNameKey] as? String)
 
         // Update or add device to list
         if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
             discoveredDevices[index].rssi = RSSI.intValue
+            if let advertisedName = device.advertisedName {
+                discoveredDevices[index].advertisedName = advertisedName
+            }
         } else {
             Log.ble.info("Discovered \(deviceType.shortName): \(device.name)")
             discoveredDevices.append(device)
@@ -756,7 +760,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
         do {
             guard let key = try frezKeyStore.read() else { throw FrezError.missingKey }
             let device = ReadingCorrectionDevice(peripheralID: peripheral.identifier, type: .frezDyno)
-            let service = FrezDynoService(peripheral: peripheral, accessKey: key)
+            let bluetoothName = FrezDeviceIdentifier.normalized(pendingDevice?.advertisedName) ?? peripheral.name
+            let service = FrezDynoService(peripheral: peripheral, accessKey: key, bluetoothName: bluetoothName)
             frezService = service
             service.onStatus = { [weak self, weak service] status in
                 guard let self, self.frezService === service else { return }
