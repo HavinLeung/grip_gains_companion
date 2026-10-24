@@ -1,14 +1,49 @@
 import SwiftUI
 import Charts
 
+/// Force graph fed by a live data source. Reading the source here (not in the parent)
+/// means each redraw re-renders only the graph.
+struct LiveForceGraphView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    let dataSource: ForceChartDataSource
+    let useLbs: Bool
+    let windowSeconds: Int  // 0 = entire session
+    let targetWeight: Double?
+    let tolerance: Double?
+    var batteryLevel: Int? = nil
+    var maxDisplayPoints = AppConstants.normalGraphMaxPoints
+
+    var body: some View {
+        ForceGraphView(
+            forceHistory: dataSource.displayHistory,
+            now: dataSource.displayDate,
+            useLbs: useLbs,
+            windowSeconds: windowSeconds,
+            targetWeight: targetWeight,
+            tolerance: tolerance,
+            batteryLevel: batteryLevel,
+            maxDisplayPoints: maxDisplayPoints
+        )
+        .onAppear { dataSource.isRenderingEnabled = scenePhase == .active }
+        .onDisappear { dataSource.isRenderingEnabled = false }
+        .onChange(of: scenePhase) { _, phase in
+            dataSource.isRenderingEnabled = phase == .active
+        }
+    }
+}
+
 /// Real-time force graph showing recent force history
 struct ForceGraphView: View {
     let forceHistory: [(timestamp: Date, force: Double)]
+    /// Right edge of a scrolling window; advanced by the data source at a capped frame rate
+    var now = Date()
     let useLbs: Bool
     let windowSeconds: Int  // 0 = entire session
     let targetWeight: Double?
     let tolerance: Double?  // Optional tolerance in same units as targetWeight (kg)
     var batteryLevel: Int? = nil  // Shown in the corner when the status bar is hidden
+    /// Cap on points drawn per frame (~2 per logical pixel normally; fewer in power saving mode)
+    var maxDisplayPoints = AppConstants.normalGraphMaxPoints
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -22,16 +57,6 @@ struct ForceGraphView: View {
     }
 
     var body: some View {
-        if windowSeconds > 0 {
-            TimelineView(.periodic(from: .now, by: 1.0 / 60)) { timeline in
-                chartContent(now: timeline.date)
-            }
-        } else {
-            chartContent(now: Date())
-        }
-    }
-
-    private func chartContent(now: Date) -> some View {
         let windowStart: Date
         let xMax: Double
 
@@ -56,8 +81,6 @@ struct ForceGraphView: View {
             filtered.append((timestamp: now, force: last.force))
         }
 
-        // Cap display points for chart performance (~2 points per logical pixel)
-        let maxDisplayPoints = 600
         let downsampled: [(timestamp: Date, force: Double)]
         if filtered.count > maxDisplayPoints {
             let stride = Double(filtered.count - 1) / Double(maxDisplayPoints - 1)
@@ -74,6 +97,9 @@ struct ForceGraphView: View {
             return (x: raw / xMax, force: $0.force)
         }
 
+        let yDomain = yAxisDomain(for: visible)
+
+        // Charts only draws the static parts; one mark per sample cost ~9 ms per frame.
         return Chart {
             // Tolerance band — explicit 0...1 X span
             if let target = targetWeight, let tol = tolerance {
@@ -95,16 +121,6 @@ struct ForceGraphView: View {
                 )
                 .foregroundStyle(Color.green.opacity(0.7))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [5, 3]))
-            }
-
-            // Force line
-            ForEach(Array(visible.enumerated()), id: \.offset) { _, sample in
-                LineMark(
-                    x: .value("Time", sample.x),
-                    y: .value("Force", displayForce(sample.force))
-                )
-                .foregroundStyle(Color.blue)
-                .lineStyle(StrokeStyle(lineWidth: 2))
             }
         }
         .chartXAxis(.hidden)
@@ -130,11 +146,39 @@ struct ForceGraphView: View {
                 }
             }
         }
-        .chartYScale(domain: yAxisDomain(for: visible))
+        .chartYScale(domain: yDomain)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                if let plotFrame = proxy.plotFrame {
+                    forceLine(visible, in: geometry[plotFrame], proxy: proxy, yDomain: yDomain)
+                }
+            }
+        }
         .frame(height: 100)
         .padding(.horizontal)
         .padding(.vertical, 8)
         .background(isDarkMode ? Color.black : Color(.systemBackground))
+    }
+
+    /// Force line drawn as a single path over the chart's plot area
+    private func forceLine(
+        _ visible: [(x: Double, force: Double)], in plot: CGRect, proxy: ChartProxy, yDomain: ClosedRange<Double>
+    ) -> some View {
+        // Map force to y through the chart's own scale, via its two domain ends (the scale is linear)
+        let yLower = proxy.position(forY: yDomain.lowerBound) ?? plot.height
+        let yUpper = proxy.position(forY: yDomain.upperBound) ?? 0
+        let span = yDomain.upperBound - yDomain.lowerBound
+        return Canvas { context, _ in
+            var path = Path()
+            for (index, sample) in visible.enumerated() {
+                let fraction = (displayForce(sample.force) - yDomain.lowerBound) / span
+                let point = CGPoint(x: plot.minX + sample.x * plot.width,
+                                    y: plot.minY + yLower + (yUpper - yLower) * fraction)
+                if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+            }
+            context.clip(to: Path(plot))
+            context.stroke(path, with: .color(.blue), style: StrokeStyle(lineWidth: 2, lineJoin: .round))
+        }
     }
 
     /// Calculate Y-axis domain based on visible data and target

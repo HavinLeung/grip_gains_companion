@@ -1859,6 +1859,94 @@ final class ProgressorHandlerTests: XCTestCase {
                        "Processing should work even without a callback")
     }
 
+    func testForceHistoryIsCappedToRecentSamples() {
+        setupIdleStateWithZeroBaseline()
+        let limit = ProgressorHandler.forceHistoryLimit
+
+        for _ in 0...(2 * limit) {
+            processTestSample(0)
+        }
+        waitForMainQueue()
+
+        XCTAssertLessThanOrEqual(handler.forceHistory.count, 2 * limit)
+        XCTAssertGreaterThanOrEqual(handler.forceHistory.count, limit)
+        let times = handler.forceHistory.map(\.timestamp)
+        XCTAssertEqual(times, times.sorted(), "The newest samples are the ones kept")
+    }
+
+    func testForceReadoutUpdatesWithEverySampleByDefault() {
+        setupIdleStateWithZeroBaseline()
+        processTestSample(5)
+        processTestSample(6)
+        processTestSample(7)
+        waitForMainQueue()
+
+        XCTAssertEqual(handler.currentForce, 7)
+    }
+
+    func testForceReadoutRateThrottlesDisplayOnly() {
+        setupIdleStateWithZeroBaseline()
+        handler.forceReadoutRate = 10
+        let historyBefore = handler.forceHistory.count
+
+        processTestSample(5)
+        processTestSample(6)
+        processTestSample(7)
+        waitForMainQueue()
+
+        XCTAssertEqual(handler.currentForce, 5, "Readout should hold within its refresh interval")
+        XCTAssertEqual(handler.forceHistory.count, historyBefore + 3, "Every sample is still processed")
+    }
+
+    func testThrottledReadoutStillPublishesFinalGripStats() {
+        setupIdleStateWithZeroBaseline()
+        handler.enablePercentageThresholds = false
+        handler.canEngage = true
+        handler.forceReadoutRate = 1  // only the first sample of this second refreshes the readout
+        processTestSample(10)  // engage
+        for _ in 0..<50 { processTestSample(10) }
+        waitForMainQueue()
+        XCTAssertTrue(handler.engaged)
+
+        processTestSample(0)  // release
+        waitForMainQueue()
+        XCTAssertFalse(handler.engaged)
+        // Final stats include the release sample, as before: 51 × 10 kg and one 0
+        XCTAssertEqual(handler.sessionMean ?? 0, 510.0 / 52, accuracy: 0.001,
+                       "Final grip stats are published even when throttled")
+    }
+
+    func testPowerSavingAndHistoryTrimmingPreserveCompleteRepSamples() {
+        var recordings: [[Double]] = []
+        var durations: [TimeInterval] = []
+        // Longer than the capped display history, with a narrow peak between readout updates.
+        let heldSamples = (0..<2000).map { $0 == 1201 ? 35.0 : 10.0 }
+        for rate: Int? in [nil, 10] {
+            let subject = ProgressorHandler()
+            subject.enableCalibration = false
+            subject.enablePercentageThresholds = false
+            subject.forceReadoutRate = rate
+            subject.processSample(0, timestamp: 0)
+            waitForMainQueue()
+            subject.canEngage = true
+            let subscription = subject.gripDisengaged.sink { duration, samples in
+                durations.append(duration)
+                recordings.append(samples)
+            }
+            for (index, force) in (heldSamples + [0]).enumerated() {
+                subject.processSample(force, timestamp: UInt32(index + 1) * 12_500)
+            }
+            waitForMainQueue()
+            withExtendedLifetime(subscription) {}
+            XCTAssertFalse(subject.engaged)
+            XCTAssertLessThan(subject.forceHistory.count, heldSamples.count)
+        }
+        XCTAssertEqual(recordings.count, 2)
+        XCTAssertEqual(recordings.first, heldSamples + [0])
+        XCTAssertEqual(recordings.last, recordings.first)
+        XCTAssertEqual(durations.first, durations.last)
+    }
+
     // MARK: - Device Timestamp Restart
 
     /// Tindeq restarts its timestamp counter when streaming resumes after a hardware tare.

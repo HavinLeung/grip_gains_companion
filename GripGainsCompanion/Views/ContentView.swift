@@ -167,6 +167,10 @@ struct ContentView: View {
     @AppStorage("expandedForceBar") private var expandedForceBar = AppConstants.defaultExpandedForceBar
     @AppStorage("showForceGraph") private var showForceGraph = AppConstants.defaultShowForceGraph
     @AppStorage("forceGraphWindow") private var forceGraphWindow = AppConstants.defaultForceGraphWindow
+    @AppStorage("powerSavingMode") private var powerSavingMode = AppConstants.defaultPowerSavingMode
+    @AppStorage("powerSavingGraphFrameRate") private var powerSavingGraphFrameRate = AppConstants.defaultPowerSavingGraphFrameRate
+    @AppStorage("powerSavingGraphMaxPoints") private var powerSavingGraphMaxPoints = AppConstants.defaultPowerSavingGraphMaxPoints
+    @AppStorage("powerSavingReadoutRate") private var powerSavingReadoutRate = AppConstants.defaultPowerSavingReadoutRate
     @AppStorage("fullScreen") private var fullScreen = AppConstants.defaultFullScreen
     @AppStorage("forceBarTheme") private var forceBarTheme = ForceBarTheme.system.rawValue
     @AppStorage("settingsButtonX") private var settingsButtonX: Double = -1
@@ -291,6 +295,10 @@ struct ContentView: View {
                 chartDataSource.clear()
             }
         }
+        .onChange(of: forceGraphWindow) { _, _ in updateChartRetention() }
+        .onChange(of: powerSavingMode) { _, _ in applyPowerSaving() }
+        .onChange(of: powerSavingGraphFrameRate) { _, _ in applyPowerSaving() }
+        .onChange(of: powerSavingReadoutRate) { _, _ in applyPowerSaving() }
         .onChange(of: whc06ScaleUnit) { _, newValue in
             if let unit = WHC06ScaleUnit(rawValue: newValue) {
                 bluetoothManager.setWHC06ScaleUnit(unit)
@@ -367,13 +375,14 @@ struct ContentView: View {
     }
 
     private var forceGraphView: some View {
-        ForceGraphView(
-            forceHistory: chartDataSource.displayHistory,
+        LiveForceGraphView(
+            dataSource: chartDataSource,
             useLbs: useLbs,
             windowSeconds: forceGraphWindow,
             targetWeight: effectiveTargetWeight,
             tolerance: effectiveWeightTolerance,
-            batteryLevel: showStatusBar ? nil : bluetoothManager.deviceBatteryLevel
+            batteryLevel: showStatusBar ? nil : bluetoothManager.deviceBatteryLevel,
+            maxDisplayPoints: powerSavingMode ? powerSavingGraphMaxPoints : AppConstants.normalGraphMaxPoints
         )
     }
 
@@ -730,6 +739,18 @@ struct ContentView: View {
         )
     }
 
+    /// Keep only what the graph window can show; "entire session" (0) keeps everything
+    private func updateChartRetention() {
+        chartDataSource.retainedSeconds = forceGraphWindow > 0 ? TimeInterval(forceGraphWindow) : nil
+    }
+
+    /// Power saving lowers how often the graph and force readout refresh; off restores normal rates
+    private func applyPowerSaving() {
+        chartDataSource.framesPerSecond = powerSavingMode ? powerSavingGraphFrameRate : AppConstants.normalGraphFrameRate
+        chartDataSource.stopsScrollingWhenIdle = powerSavingMode
+        progressorHandler.forceReadoutRate = powerSavingMode ? powerSavingReadoutRate : nil
+    }
+
     /// Update the handler's target weight based on current settings
     private func updateTargetWeight() {
         progressorHandler.targetWeight = effectiveTargetWeight
@@ -899,6 +920,8 @@ struct ContentView: View {
         }
 
         // Handler processed sample -> Chart data source
+        updateChartRetention()
+        applyPowerSaving()
         progressorHandler.onSampleProcessed = { [chartDataSource] timestamp, force in
             chartDataSource.addSample(timestamp: timestamp, force: force)
         }

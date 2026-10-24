@@ -50,8 +50,17 @@ class ProgressorHandler: ObservableObject {
     @Published private(set) var sessionMean: Double?
     @Published private(set) var sessionStdDev: Double?
 
-    // Force history for graph (timestamp, force value)
+    /// Recent processed samples (display timestamp, raw force), capped so a long session
+    /// doesn't grow memory; only the newest entry is needed (to rebase after reconnects).
     private(set) var forceHistory: [(timestamp: Date, force: Double)] = []
+    static let forceHistoryLimit = 800  // ~10 s at 80 Hz
+
+    /// Readout updates per second (force and live grip stats), or nil to update with every sample.
+    /// Display only: detection and recording always use every sample.
+    var forceReadoutRate: Int?
+    private var lastReadoutUpdate: TimeInterval = -.infinity
+    /// Whether the sample being processed should refresh the readout
+    private var readoutDue = true
 
     /// Called after each sample is processed, with the display timestamp and force value
     var onSampleProcessed: ((Date, Double) -> Void)?
@@ -214,7 +223,8 @@ class ProgressorHandler: ObservableObject {
             // A reset (including a reading correction change) invalidates samples
             // queued using the previous scale/baseline.
             guard generation == sampleGeneration else { return }
-            currentForce = rawWeight
+            readoutDue = isReadoutDue()
+            if readoutDue { currentForce = rawWeight }
 
             // Device timestamp went backwards: its counter restarted (e.g. streaming resumed
             // after a hardware tare) or wrapped. Rebase like a reconnect so offsets can't underflow.
@@ -246,6 +256,9 @@ class ProgressorHandler: ObservableObject {
             }
 
             forceHistory.append((timestamp: displayTimestamp, force: rawWeight))
+            if forceHistory.count > 2 * Self.forceHistoryLimit {
+                forceHistory.removeFirst(forceHistory.count - Self.forceHistoryLimit)
+            }
             onSampleProcessed?(displayTimestamp, rawWeight)
             processStateTransition(rawWeight: rawWeight, timestamp: timestamp)
             if let difference = preparationFeedback.update(
@@ -302,6 +315,14 @@ class ProgressorHandler: ObservableObject {
         accumulatedGripDuration = 0
     }
 
+    private func isReadoutDue() -> Bool {
+        guard let rate = forceReadoutRate, rate > 0 else { return true }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastReadoutUpdate >= 1 / Double(rate) else { return false }
+        lastReadoutUpdate = now
+        return true
+    }
+
     // MARK: - State Machine Logic
 
     private func processStateTransition(rawWeight: Double, timestamp: UInt32) {
@@ -343,10 +364,12 @@ class ProgressorHandler: ObservableObject {
             samples.append(sample)
             let taredWeight = rawWeight - baseline
 
-            // Calculate live statistics from raw samples
+            // Calculate live statistics from raw samples; the final values are always shown
             let weights = samples.map(\.weight)
-            sessionMean = mean(weights)
-            sessionStdDev = standardDeviation(weights)
+            if readoutDue || taredWeight < effectiveFailThreshold {
+                sessionMean = mean(weights)
+                sessionStdDev = standardDeviation(weights)
+            }
 
             if taredWeight < effectiveFailThreshold {
                 // Grip failed - keep statistics for display after grip ends

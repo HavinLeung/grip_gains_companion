@@ -57,6 +57,19 @@ struct AppConstants {
     static let defaultExpandedForceBar: Bool = true
     static let defaultShowForceGraph: Bool = true
     static let defaultForceGraphWindow: Int = 5
+
+    // MARK: - Power Saving
+    /// Off keeps the normal values below; on uses the power saving values, which the user can adjust.
+    static let defaultPowerSavingMode: Bool = false
+    static let normalGraphFrameRate: Int = 60
+    static let normalGraphMaxPoints: Int = 600
+    static let defaultPowerSavingGraphFrameRate: Int = 15
+    static let defaultPowerSavingGraphMaxPoints: Int = 150
+    /// Force readout updates per second; normally it updates with every sample
+    static let defaultPowerSavingReadoutRate: Int = 10
+    static let graphFrameRateOptions = [10, 15, 20, 30, 60]
+    static let graphMaxPointsOptions = [100, 150, 300, 600]
+    static let readoutRateOptions = [5, 10, 20]
     static let defaultFullScreen: Bool = true
     static let defaultEnableTargetWeight: Bool = true
     static let defaultUseManualTarget: Bool = false

@@ -8,6 +8,10 @@ struct AdvancedSettingsView: View {
     let onSaveReadingCorrection: (ReadingCorrection, ReadingCorrectionDevice) -> Bool
 
     @State private var editingDevice: ReadingCorrectionDevice?
+    @AppStorage("powerSavingMode") private var powerSavingMode = AppConstants.defaultPowerSavingMode
+    @AppStorage("powerSavingGraphFrameRate") private var powerSavingGraphFrameRate = AppConstants.defaultPowerSavingGraphFrameRate
+    @AppStorage("powerSavingGraphMaxPoints") private var powerSavingGraphMaxPoints = AppConstants.defaultPowerSavingGraphMaxPoints
+    @AppStorage("powerSavingReadoutRate") private var powerSavingReadoutRate = AppConstants.defaultPowerSavingReadoutRate
 
     var body: some View {
         List {
@@ -36,6 +40,25 @@ struct AdvancedSettingsView: View {
                 Text(bluetoothManager.connectionState == .connected
                      ? "Adjust readings if your device reports an incorrect scale or offset. Saved for this device."
                      : "Connect a device to adjust its readings if it reports an incorrect scale or offset.")
+            }
+
+            Section {
+                Toggle("Power Saving Mode", isOn: $powerSavingMode)
+                if powerSavingMode {
+                    Picker("Graph Frame Rate", selection: $powerSavingGraphFrameRate) {
+                        ForEach(AppConstants.graphFrameRateOptions, id: \.self) { Text("\($0) fps").tag($0) }
+                    }
+                    Picker("Graph Detail", selection: $powerSavingGraphMaxPoints) {
+                        ForEach(AppConstants.graphMaxPointsOptions, id: \.self) { Text("\($0) points").tag($0) }
+                    }
+                    Picker("Force Readout", selection: $powerSavingReadoutRate) {
+                        ForEach(AppConstants.readoutRateOptions, id: \.self) { Text("\($0)× per second").tag($0) }
+                    }
+                }
+            } footer: {
+                Text(powerSavingMode
+                     ? "Refreshes the force graph and readout less often to save battery. Grip detection and saved reps still use every reading."
+                     : "Refresh the force graph and readout less often to save battery. Normally the graph runs at \(AppConstants.normalGraphFrameRate) fps with up to \(AppConstants.normalGraphMaxPoints) points, and the readout updates with every reading.")
             }
         }
         .navigationTitle("Advanced")

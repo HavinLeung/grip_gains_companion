@@ -100,6 +100,10 @@ struct SettingsView: View {
     @AppStorage("expandedForceBar") private var expandedForceBar = AppConstants.defaultExpandedForceBar
     @AppStorage("showForceGraph") private var showForceGraph = AppConstants.defaultShowForceGraph
     @AppStorage("forceGraphWindow") private var forceGraphWindow = AppConstants.defaultForceGraphWindow
+    @AppStorage("powerSavingMode") private var powerSavingMode = AppConstants.defaultPowerSavingMode
+    @AppStorage("powerSavingGraphFrameRate") private var powerSavingGraphFrameRate = AppConstants.defaultPowerSavingGraphFrameRate
+    @AppStorage("powerSavingGraphMaxPoints") private var powerSavingGraphMaxPoints = AppConstants.defaultPowerSavingGraphMaxPoints
+    @AppStorage("powerSavingReadoutRate") private var powerSavingReadoutRate = AppConstants.defaultPowerSavingReadoutRate
     @AppStorage("fullScreen") private var fullScreen = AppConstants.defaultFullScreen
     @AppStorage("forceBarTheme") private var forceBarTheme = ForceBarTheme.system.rawValue
     @AppStorage("enableTargetWeight") private var enableTargetWeight = AppConstants.defaultEnableTargetWeight
@@ -739,6 +743,12 @@ struct SettingsView: View {
         expandedForceBar = AppConstants.defaultExpandedForceBar
         showForceGraph = AppConstants.defaultShowForceGraph
         forceGraphWindow = AppConstants.defaultForceGraphWindow
+
+        // Power saving
+        powerSavingMode = AppConstants.defaultPowerSavingMode
+        powerSavingGraphFrameRate = AppConstants.defaultPowerSavingGraphFrameRate
+        powerSavingGraphMaxPoints = AppConstants.defaultPowerSavingGraphMaxPoints
+        powerSavingReadoutRate = AppConstants.defaultPowerSavingReadoutRate
 
         // Target weight
         enableTargetWeight = AppConstants.defaultEnableTargetWeight
