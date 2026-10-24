@@ -2,6 +2,26 @@ import Foundation
 
 /// JavaScript code snippets for interacting with the gripgains.ca web UI
 enum JavaScriptBridge {
+    /// Keep the mobile menu scrollable when native controls reduce the web view height.
+    /// Adapted from jakemcc/grip_gains_companion commit 0f110bb71d5892ab7ac5d27ebe8c79c5ce11855f.
+    static let mobileNavigationScrollFixScript = """
+        (function() {
+            const styleId = 'grip-gains-companion-mobile-menu-scroll';
+            if (document.getElementById(styleId)) return;
+
+            const style = document.createElement('style');
+            style.id = styleId;
+            style.textContent = `
+                [class~="lg:hidden"][class~="fixed"][class~="inset-0"] > [class~="w-64"][class~="h-full"] {
+                    overflow-y: auto !important;
+                    overscroll-behavior-y: contain;
+                    -webkit-overflow-scrolling: touch;
+                }
+            `;
+            document.head.appendChild(style);
+        })();
+    """
+
     /// Report a timer page that finished loading without its workout view. After a deploy,
     /// cached HTML can reference a removed workout chunk: the menu renders, the workout doesn't.
     /// `.timer-view` is the TimerView root and stays mounted for the whole workout.

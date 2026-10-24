@@ -59,6 +59,13 @@ struct TimerWebView: UIViewRepresentable {
         )
         contentController.addUserScript(closePickerScript)
 
+        // Let the mobile menu scroll to Basic Timer even in a shortened web view.
+        contentController.addUserScript(WKUserScript(
+            source: JavaScriptBridge.mobileNavigationScrollFixScript,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        ))
+
         // Inject observer script on document end
         let observerScript = WKUserScript(
             source: JavaScriptBridge.observerScript,
