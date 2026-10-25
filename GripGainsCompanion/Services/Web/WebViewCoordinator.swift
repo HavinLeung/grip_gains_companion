@@ -1,6 +1,19 @@
 import WebKit
 import Combine
 
+/// Shared for the app process, including replacement coordinators and WebViews.
+/// Tests inject a separate lifetime to model a genuinely new app launch.
+final class StartupRecoveryLifetime {
+    static let shared = StartupRecoveryLifetime()
+    private var claimed = false
+
+    func claim() -> Bool {
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
 /// Coordinator for WKWebView that handles JavaScript message callbacks
 /// This bridges JavaScript calls back to Swift
 class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
@@ -21,6 +34,7 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private(set) var isPreparationPhase = false
 
     func updatePreparationState(_ preparing: Bool) {
+        if preparing { cancelStartupRecovery() }
         isPreparationPhase = preparing
         onPreparationStateChanged?(preparing)
     }
@@ -40,36 +54,56 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
     /// Whether gripgains.ca's own (Web Audio) sounds are currently muted
     var websiteAudioMuted = false
 
-    // Only attempt offline cache fallback before the first completed page load.
-    private var finishedPageLoads = 0
-
     private var initialPageURL: URL?
-    private var triedCachedInitialPage = false
-    private var recoveredMissingWorkout = false
+    private var initialNavigation: WKNavigation?
     private var checkingMissingWorkout = false
     private var pageGeneration = 0
     private var pageCommitted = false
     private var pageBackgrounded = false
-    private var startupRecoveryCancelled = false
+    private var startupRecoveryCancelled = true
+    private let startupRecoveryLifetime: StartupRecoveryLifetime
+    private var startupNavigation: WKNavigation?
+    private var startupRecoveryScript: WKUserScript?
+    private var startupDelay: TimeInterval = 3
+    private var startupDeadline: ContinuousClock.Instant?
+    private var pageURLObservation: NSKeyValueObservation?
 
-    override init() {
+    init(startupRecoveryLifetime: StartupRecoveryLifetime = .shared) {
+        self.startupRecoveryLifetime = startupRecoveryLifetime
         super.init()
     }
 
     func setWebView(_ webView: WKWebView) {
+        cancelStartupRecovery()
         self.webView = webView
         pageGeneration += 1
         pageCommitted = false
-        finishedPageLoads = 0
+        initialNavigation = nil
     }
 
     /// Revalidate the HTML on launch so a deploy can't leave cached HTML pointing at removed
     /// workout chunks (the site sends no Cache-Control, so WebKit may otherwise reuse it).
     /// Offline, `didFailProvisionalNavigation` falls back to the cached copy.
-    func loadInitialPage(_ url: URL) {
+    func loadInitialPage(_ url: URL, missingWorkoutDelay: TimeInterval = 3) {
+        guard let webView else { return }
+        cancelStartupRecovery()
         initialPageURL = url
-        triedCachedInitialPage = false
-        webView?.load(URLRequest(url: url, cachePolicy: .reloadRevalidatingCacheData))
+        if startupRecoveryLifetime.claim(), !pageBackgrounded, url.path == "/timer" {
+            startupRecoveryCancelled = false
+            startupDelay = missingWorkoutDelay
+            let script = WKUserScript(source: JavaScriptBridge.missingWorkoutCheckScript,
+                                      injectionTime: .atDocumentStart, forMainFrameOnly: true)
+            startupRecoveryScript = script
+            webView.configuration.userContentController.addUserScript(script)
+            // Vue login and other route changes do not necessarily start a WKNavigation.
+            pageURLObservation = webView.observe(\.url, options: [.new]) { [weak self] _, change in
+                guard let self, let url = change.newValue ?? nil, url != self.initialPageURL else { return }
+                self.cancelStartupRecovery()
+            }
+        }
+        let navigation = webView.load(URLRequest(url: url, cachePolicy: .reloadRevalidatingCacheData))
+        initialNavigation = navigation
+        if !startupRecoveryCancelled { startupNavigation = navigation }
     }
 
     /// Cancel on background even if WebKit suspends before delivering visibilitychange.
@@ -78,7 +112,25 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
         guard pageBackgrounded != backgrounded else { return }
         pageBackgrounded = backgrounded
         guard backgrounded else { return }
+        cancelStartupRecovery()
+    }
+
+    private func removeStartupRecoveryScript() {
+        guard let script = startupRecoveryScript, let controller = webView?.configuration.userContentController else { return }
+        // Snapshot WebKit's bridged collection before mutating it; preserve all other bridges.
+        let remaining = controller.userScripts.filter { $0.source != script.source }
+        controller.removeAllUserScripts()
+        remaining.forEach { controller.addUserScript($0) }
+        startupRecoveryScript = nil
+    }
+
+    private func cancelStartupRecovery() {
+        guard !startupRecoveryCancelled else { return }
         startupRecoveryCancelled = true
+        startupNavigation = nil
+        startupDeadline = nil
+        pageURLObservation = nil
+        removeStartupRecoveryScript()
         let generation = pageGeneration
         Task { @MainActor [weak self] in
             guard let self, self.pageGeneration == generation else { return }
@@ -86,10 +138,16 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
         }
     }
 
+    private var canRecoverStartup: Bool {
+        !startupRecoveryCancelled && !pageBackgrounded && pageCommitted &&
+            startupDeadline.map { ContinuousClock.now < $0 } == true &&
+            webView?.url == initialPageURL && UIApplication.shared.applicationState != .background
+    }
+
     /// Reload at most once, after confirming the report still refers to a missing workout
     /// in the current foreground document. A report can outlive the state that produced it.
     private func recoverMissingWorkout(_ message: WKScriptMessage) {
-        guard pageCommitted, !recoveredMissingWorkout, !checkingMissingWorkout, !startupRecoveryCancelled,
+        guard canRecoverStartup, !checkingMissingWorkout,
               message.frameInfo.isMainFrame, let token = message.body as? String,
               let webView, message.webView === webView else { return }
         checkingMissingWorkout = true
@@ -98,16 +156,14 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
             guard let self else { return }
             defer { self.checkingMissingWorkout = false }
             guard let webView, self.webView === webView,
-                  self.pageGeneration == generation, self.pageCommitted, !self.startupRecoveryCancelled,
-                  !self.pageBackgrounded, UIApplication.shared.applicationState != .background else { return }
+                  self.pageGeneration == generation, self.canRecoverStartup else { return }
             let confirmed = try? await webView.callAsyncJavaScript(
                 "return window.__ggConfirmWorkoutRecovery?.(token) === true;",
                 arguments: ["token": token], in: nil, contentWorld: .page
             )
             guard confirmed as? Bool == true, self.webView === webView,
-                  self.pageGeneration == generation, self.pageCommitted, !self.startupRecoveryCancelled,
-                  !self.pageBackgrounded, UIApplication.shared.applicationState != .background else { return }
-            self.recoveredMissingWorkout = true
+                  self.pageGeneration == generation, self.canRecoverStartup else { return }
+            self.cancelStartupRecovery()
             webView.reloadFromOrigin()
         }
     }
@@ -117,29 +173,55 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         pageGeneration += 1
         pageCommitted = false
-        startupRecoveryCancelled = pageBackgrounded
+        if navigation !== initialNavigation { initialNavigation = nil }
+        if navigation !== startupNavigation { cancelStartupRecovery() }
         updatePreparationState(false)
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         pageCommitted = true
+        initialNavigation = nil
+        guard !startupRecoveryCancelled, navigation === startupNavigation else { return }
+        // Never install the startup check in a replacement document, even at the same URL.
+        removeStartupRecoveryScript()
+        let checkAt = ContinuousClock.now.advanced(by: .seconds(startupDelay))
+        let deadline = checkAt.advanced(by: .seconds(1))
+        startupDeadline = deadline
+        let generation = pageGeneration
+        Task { @MainActor [weak self, weak webView] in
+            guard let self, let webView, self.pageGeneration == generation, self.canRecoverStartup else { return }
+            let remaining = ContinuousClock.now.duration(to: checkAt).components
+            let milliseconds = max(0, remaining.seconds * 1000 + remaining.attoseconds / 1_000_000_000_000_000)
+            _ = try? await webView.callAsyncJavaScript(
+                "window.__ggStartWorkoutRecovery?.(delay);",
+                arguments: ["delay": milliseconds], in: nil, contentWorld: .page
+            )
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(until: deadline, clock: .continuous)
+            guard let self, self.startupDeadline == deadline else { return }
+            self.cancelStartupRecovery()
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         let error = error as NSError
         if error.domain == NSURLErrorDomain, error.code != NSURLErrorCancelled,
-           !triedCachedInitialPage, finishedPageLoads == 0, let initialPageURL {
-            triedCachedInitialPage = true
-            webView.load(URLRequest(url: initialPageURL, cachePolicy: .returnCacheDataDontLoad))
+           let initialNavigation, navigation === initialNavigation, let initialPageURL {
+            // Only a failed initial request can use the offline copy, never a later navigation.
+            self.initialNavigation = nil
+            let isStartup = !startupRecoveryCancelled && navigation === startupNavigation
+            let cachedNavigation = webView.load(URLRequest(url: initialPageURL, cachePolicy: .returnCacheDataDontLoad))
+            if isStartup { startupNavigation = cachedNavigation }
         }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        cancelStartupRecovery()
         updatePreparationState(false)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        finishedPageLoads += 1
         Task { @MainActor in
             _ = try? await webView.evaluateJavaScript(JavaScriptBridge.observerScript)
 
@@ -162,6 +244,7 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
         case "buttonState":
             if let enabled = message.body as? Bool {
+                if enabled { cancelStartupRecovery() }
                 DispatchQueue.main.async { [weak self] in
                     self?.onButtonStateChanged?(enabled)
                 }
@@ -293,6 +376,7 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     /// Click the "Start" button via JavaScript injection
     func clickStartButton() {
+        cancelStartupRecovery()
         Task { @MainActor in
             try? await webView?.evaluateJavaScript(JavaScriptBridge.clickStartButton)
         }
@@ -317,6 +401,7 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     /// Reload the current page
     func reloadPage() {
+        cancelStartupRecovery()
         Task { @MainActor in
             webView?.reload()
         }
@@ -324,6 +409,7 @@ class WebViewCoordinator: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     /// Clear all website data (cache, cookies, storage) and reload
     func clearWebsiteData() {
+        cancelStartupRecovery()
         Task { @MainActor in
             let dataStore = WKWebsiteDataStore.default()
             let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()

@@ -6,7 +6,7 @@ struct TimerWebView: UIViewRepresentable {
     let coordinator: WebViewCoordinator
     var url = AppConstants.gripGainsURL
     var websiteDataStore = WKWebsiteDataStore.default()
-    /// How long after load the timer page may lack its workout view before one recovery reload.
+    /// How long after the first document commits to check for the workout view.
     var missingWorkoutDelay: TimeInterval = 3
     @Environment(\.scenePhase) private var scenePhase
 
@@ -44,12 +44,6 @@ struct TimerWebView: UIViewRepresentable {
             forMainFrameOnly: false
         )
         contentController.addUserScript(backgroundTimeScript)
-
-        contentController.addUserScript(WKUserScript(
-            source: JavaScriptBridge.missingWorkoutCheckScript(delayMilliseconds: Int(missingWorkoutDelay * 1000)),
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
-        ))
 
         // Inject script to close weight picker if it's open on page load
         let closePickerScript = WKUserScript(
@@ -112,7 +106,7 @@ struct TimerWebView: UIViewRepresentable {
         coordinator.setPageBackgrounded(scenePhase == .background)
 
         // Load only on creation; SwiftUI updates and app resumes must preserve the live workout.
-        coordinator.loadInitialPage(url)
+        coordinator.loadInitialPage(url, missingWorkoutDelay: missingWorkoutDelay)
 
         return webView
     }
